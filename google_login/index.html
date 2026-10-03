@@ -1,1 +1,111 @@
 
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body { margin: 0; font: 14px system-ui, sans-serif; color: #31333f; }
+    #status { margin: 8px 0; }
+    #button { min-height: 42px; }
+  </style>
+</head>
+<body>
+  <div id="button"></div>
+  <div id="status" role="status" aria-live="polite"></div>
+  <script>
+    const button = document.getElementById('button');
+    const status = document.getElementById('status');
+    let initializedFor = '';
+
+    function send(type, value) {
+      window.parent.postMessage({isStreamlitMessage: true, type, value}, '*');
+    }
+
+    function setValue(value) {
+      send('streamlit:setComponentValue', value);
+    }
+
+    function frameHeight() {
+      window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:setFrameHeight', height: 76}, '*');
+    }
+
+    function waitForScripts() {
+      return new Promise((resolve, reject) => {
+        const start = Date.now();
+        const poll = () => {
+          if (window.google?.accounts?.id && window.supabase?.createClient) return resolve();
+          if (Date.now() - start > 15000) return reject(new Error('Google sign-in could not load. Check your connection and reload the page.'));
+          setTimeout(poll, 100);
+        };
+        poll();
+      });
+    }
+
+    async function setup(args) {
+      const clientId = args.google_client_id;
+      if (!clientId || !args.supabase_url || !args.supabase_key) {
+        status.textContent = 'Google sign-in is not configured.';
+        return;
+      }
+      if (initializedFor === clientId) return;
+      initializedFor = clientId;
+      button.replaceChildren();
+      status.textContent = 'Loading Google sign-in…';
+      frameHeight();
+      try {
+        await waitForScripts();
+        const supabaseClient = window.supabase.createClient(args.supabase_url, args.supabase_key, {
+          auth: {persistSession: false, autoRefreshToken: false, detectSessionInUrl: false}
+        });
+        const rawNonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
+        const encodedNonce = new TextEncoder().encode(rawNonce);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', encodedNonce);
+        const hashedNonce = Array.from(new Uint8Array(hashBuffer))
+          .map(byte => byte.toString(16).padStart(2, '0')).join('');
+
+        window.google.accounts.id.initialize({
+          client_id: clientId,
+          nonce: hashedNonce,
+          callback: async (response) => {
+            status.textContent = 'Signing in…';
+            button.style.pointerEvents = 'none';
+            try {
+              const {data, error} = await supabaseClient.auth.signInWithIdToken({
+                provider: 'google',
+                token: response.credential,
+                nonce: rawNonce
+              });
+              if (error) throw error;
+              if (!data.session?.access_token || !data.session?.refresh_token) {
+                throw new Error('Supabase did not return a session.');
+              }
+              setValue({access_token: data.session.access_token, refresh_token: data.session.refresh_token});
+              status.textContent = 'Signed in. Opening your workspace…';
+            } catch (error) {
+              button.style.pointerEvents = '';
+              status.textContent = error?.message || 'Sign-in failed. Check the Google and Supabase setup.';
+            }
+          }
+        });
+        window.google.accounts.id.renderButton(button, {
+          type: 'standard', theme: 'outline', size: 'large',
+          text: 'continue_with', shape: 'rectangular', width: 280
+        });
+        status.textContent = '';
+        frameHeight();
+      } catch (error) {
+        status.textContent = error?.message || 'Google sign-in could not load.';
+      }
+    }
+
+    window.addEventListener('message', event => {
+      if (event.data?.type === 'streamlit:render') setup(event.data.args || {});
+    });
+    window.parent.postMessage({isStreamlitMessage: true, type: 'streamlit:componentReady', apiVersion: 1}, '*');
+    frameHeight();
+  </script>
+</body>
+</html>
